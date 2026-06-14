@@ -4,7 +4,7 @@ emoji: 🩺
 colorFrom: teal
 colorTo: blue
 sdk: gradio
-sdk_version: 4.44.1
+sdk_version: 6.17.3
 python_version: 3.10
 app_file: app.py
 pinned: false
@@ -26,28 +26,36 @@ The prototype is intentionally conservative: it does not diagnose, prescribe, or
 
 PrivateMD uses a local-first RAG pipeline designed for clinical traceability:
 
-- Typed evidence chunks from FHIR resources including conditions, medications, observations, diagnostic reports, encounters, procedures, care plans, and imaging metadata.
-- Hybrid retrieval with BM25-style lexical scoring, clinical entity expansion, resource-type priors, and recency weighting.
-- Google LangExtract integration for structured, source-grounded clinical extraction when enabled.
-- Optional small Gemma generation layer over retrieved evidence, with deterministic synthesis as the default fallback.
+- Typed evidence chunks from FHIR resources including conditions, medications, observations, diagnostic reports, encounters, procedures, care plans, imaging metadata, DNA summaries, and derived lab trends.
+- Query planning with clinical alias expansion and optional Google LangExtract extraction.
+- Multi-stage retrieval with fielded BM25, resource-type priors, temporal intent scoring, graph expansion through encounters/facets, and MMR diversification to avoid repeated near-duplicate evidence.
+- Optional Gemma 3 4B generation layer over retrieved evidence, with deterministic synthesis as the fallback when no local model server is running.
 - Source citations remain visible in the answer and in the retrieved evidence table.
 
-LangExtract can be enabled with a local Ollama model such as `gemma2:2b`:
+LangExtract and the local generator are designed around Gemma 3 4B. With Ollama:
+
+```bash
+ollama pull gemma3:4b
+```
+
+Then run PrivateMD with LangExtract and Gemma generation:
 
 ```bash
 export PRIVATE_MD_USE_LANGEXTRACT=1
-export LANGEXTRACT_MODEL_ID=gemma2:2b
+export LANGEXTRACT_MODEL_ID=gemma3:4b
 export LANGEXTRACT_MODEL_URL=http://localhost:11434
+export PRIVATE_MD_GENERATOR=ollama
+export PRIVATE_MD_OLLAMA_MODEL=gemma3:4b
 python app.py
 ```
 
-LangExtract requires Python 3.10 or newer. The Hugging Face Space metadata pins Python 3.10; on older local Python versions, PrivateMD falls back to deterministic entity extraction.
+LangExtract requires Python 3.10 or newer. This repo has been tested locally with Python 3.11.
 
-Optional local Gemma answer synthesis can be enabled when `transformers`, `torch`, and local model weights are available:
+Optional Hugging Face Transformers generation can use the official 4B instruction model when `transformers`, `torch`, and accepted Gemma model access are available:
 
 ```bash
-export PRIVATE_MD_GENERATOR=gemma
-export PRIVATE_MD_GEMMA_MODEL=google/gemma-2-2b-it
+export PRIVATE_MD_GENERATOR=hf
+export PRIVATE_MD_GEMMA_MODEL=google/gemma-3-4b-it
 python app.py
 ```
 
@@ -66,6 +74,8 @@ This app uses the Coherent Synthetic Data Set included under `data/coherent-11-0
 ## Run Locally
 
 ```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```

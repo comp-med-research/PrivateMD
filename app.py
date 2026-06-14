@@ -66,7 +66,7 @@ def ask(label, question):
     return answer_question(choice_lookup[label], question)
 
 
-with gr.Blocks(css=CSS, title="PrivateMD") as demo:
+with gr.Blocks(title="PrivateMD") as demo:
     gr.HTML(
         """
         <div class="app-header">
@@ -96,14 +96,12 @@ with gr.Blocks(css=CSS, title="PrivateMD") as demo:
                 label="Longitudinal patient journey",
                 wrap=True,
                 interactive=False,
-                height=420,
             )
         with gr.Tab("Treatment Opportunities"):
             opportunities = gr.Dataframe(
                 label="Rule-based, evidence-cited review prompts",
                 wrap=True,
                 interactive=False,
-                height=360,
             )
             sources = gr.Markdown()
         with gr.Tab("Copilot"):
@@ -118,7 +116,6 @@ with gr.Blocks(css=CSS, title="PrivateMD") as demo:
                 label="Retrieved evidence chunks",
                 wrap=True,
                 interactive=False,
-                height=320,
             )
 
     load.click(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
@@ -128,4 +125,4 @@ with gr.Blocks(css=CSS, title="PrivateMD") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(css=CSS)
