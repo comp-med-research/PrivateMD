@@ -79,7 +79,7 @@ CLINICAL_ALIASES = {
 STOPWORDS = {
     "the", "and", "for", "with", "that", "this", "from", "what", "should", "review",
     "patient", "before", "after", "about", "into", "their", "there", "while", "when",
-    "does", "have", "has", "are", "was", "were", "can", "could", "would",
+    "does", "have", "has", "are", "was", "were", "can", "could", "would", "how",
 }
 
 
@@ -152,6 +152,17 @@ def _age(patient: Dict[str, Any]) -> str:
     today = datetime.utcnow()
     years = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
     return f"{years} years"
+
+
+def _age_years(patient: Dict[str, Any]) -> Optional[int]:
+    birth = patient.get("birthDate")
+    if not birth:
+        return None
+    born = _parse_date(birth)
+    if born == datetime.min:
+        return None
+    today = datetime.utcnow()
+    return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
 
 
 def _source(resource: Dict[str, Any]) -> str:
@@ -438,7 +449,6 @@ def _langextract_entities(text: str) -> Tuple[Set[str], str]:
         lx = import_module("langextract")
         lx_data = import_module("langextract.data")
         lx_prompt_validation = import_module("langextract.prompt_validation")
-        lx_ollama = import_module("langextract.providers.ollama")
     except ImportError:
         return set(), "not installed"
 
@@ -469,28 +479,17 @@ def _langextract_entities(text: str) -> Tuple[Set[str], str]:
     status = f"enabled via {model_id}"
     if "gemini" not in model_id.lower():
         status += " local"
-    model = None
-    resolver_params = {"suppress_parse_errors": True}
-    if "gemini" not in model_id.lower():
-        model = lx_ollama.OllamaLanguageModel(
-            model_id=model_id,
-            model_url=model_url,
-            timeout=int(os.getenv("LANGEXTRACT_TIMEOUT", "120")),
-        )
-        resolver_params["format_handler"] = lx_ollama.OLLAMA_FORMAT_HANDLER
     kwargs = dict(
         text_or_documents=text[:2000],
         prompt_description=prompt,
         examples=examples,
-        model=model,
-        model_id=model_id if model is None else None,
-        model_url=model_url if model is None else None,
+        model_id=model_id,
+        model_url=model_url,
         extraction_passes=1,
         max_workers=1,
         max_char_buffer=800,
         temperature=0.0,
-        use_schema_constraints=False,
-        resolver_params=resolver_params,
+        resolver_params={"suppress_parse_errors": True},
         prompt_validation_level=lx_prompt_validation.PromptValidationLevel.OFF,
         show_progress=False,
     )
@@ -912,6 +911,62 @@ def _evidence_frame(scored_chunks: List[Tuple[float, EvidenceChunk]]) -> pd.Data
     )
 
 
+def _direct_patient_answer(bundle: Dict[str, Any], question: str) -> Optional[Tuple[str, pd.DataFrame]]:
+    lower = question.lower().strip()
+    tokens = set(_tokens(question))
+    asks_age = (
+        "how old" in lower
+        or "age" in tokens
+        or "old" in tokens
+        or "birthdate" in tokens
+        or "dob" in tokens
+        or "date of birth" in lower
+        or "birthday" in tokens
+    )
+    asks_identity = any(term in tokens for term in {"name", "gender", "sex", "demographics"})
+    if not asks_age and not asks_identity:
+        return None
+
+    patient = _entries(bundle, "Patient")[0]
+    age_years = _age_years(patient)
+    name = _patient_name(patient)
+    birth_date = patient.get("birthDate", "unknown")
+    gender = patient.get("gender", "unknown")
+    source = f"Patient/{patient.get('id', 'unknown')}"
+
+    facts = []
+    if asks_age:
+        if age_years is None:
+            facts.append(f"The patient age cannot be calculated because `{source}` has no usable birth date.")
+        else:
+            facts.append(f"{name} is **{age_years} years old** based on birth date `{birth_date}` in `{source}`.")
+    if asks_identity:
+        facts.append(f"Demographics in `{source}`: name `{name}`, gender `{gender}`, birth date `{birth_date}`.")
+
+    evidence = pd.DataFrame(
+        [
+            {
+                "rank": 1,
+                "score": 1.0,
+                "type": "Patient",
+                "date": birth_date,
+                "evidence": f"Patient demographics: name={name}; gender={gender}; birthDate={birth_date}; age={_age(patient)}",
+                "facets": "demographics, patient",
+                "source": source,
+            }
+        ]
+    )
+    answer = (
+        "PrivateMD answered this from the Patient demographics resource rather than RAG generation.\n\n"
+        f"**Question:** {question}\n\n"
+        "**Grounded answer:**\n"
+        + "\n".join(facts)
+        + "\n\n**Retrieved evidence:**\n"
+        + f"- Patient demographics from `{source}` with birth date `{birth_date}`."
+    )
+    return answer, evidence
+
+
 def _grounding_prompt(question: str, plan: QueryPlan, scored_chunks: List[Tuple[float, EvidenceChunk]]) -> str:
     context = "\n".join(
         f"[{i}] type={chunk.resource_type}; date={chunk.date or 'n/a'}; source={chunk.source}; evidence={chunk.text}"
@@ -1013,6 +1068,9 @@ def answer_question(path: str, question: str) -> Tuple[str, pd.DataFrame]:
     bundle = load_bundle(path)
     if not question.strip():
         question = "What are the most important issues in this chart?"
+    direct = _direct_patient_answer(bundle, question)
+    if direct:
+        return direct
     scored_chunks, plan, langextract_state = retrieve_evidence(bundle, question)
     generated, generator_state = _local_gemma_answer(question, plan, scored_chunks)
     evidence_lines = [
