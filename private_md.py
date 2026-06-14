@@ -606,6 +606,133 @@ def extract_medications(path: str) -> Tuple[str, str, pd.DataFrame, pd.DataFrame
     return summary, narrative, fhir_frame, grouped_frame, spans_frame, visualization_path
 
 
+def _langextract_chat_result(text: str):
+    lx = import_module("langextract")
+    lx_data = import_module("langextract.data")
+    lx_prompt_validation = import_module("langextract.prompt_validation")
+    prompt = """
+Extract clinically relevant entities and relationships from a grounded chart answer.
+Rules:
+1. Extract exact source spans in the order they appear.
+2. Classes include condition, medication, lab, value, date, procedure, imaging, genomic, demographic, source, recommendation, uncertainty, and safety_scope.
+3. Related spans must share a claim_group attribute.
+4. Source citations such as [1] and FHIR references such as Patient/abc or MedicationRequest MR1 should be extracted as source.
+5. Do not infer entities that are not present in the answer text.
+"""
+    examples = [
+        lx_data.ExampleData(
+            text=(
+                "Alda Kris is 110 years old based on birth date 1915-06-23 "
+                "from Patient/c04befa5 [1]. Clinician should verify demographics before acting."
+            ),
+            extractions=[
+                lx_data.Extraction(extraction_class="demographic", extraction_text="110 years old", attributes={"claim_group": "patient age"}),
+                lx_data.Extraction(extraction_class="date", extraction_text="1915-06-23", attributes={"claim_group": "patient age"}),
+                lx_data.Extraction(extraction_class="source", extraction_text="Patient/c04befa5", attributes={"claim_group": "patient age"}),
+                lx_data.Extraction(extraction_class="source", extraction_text="[1]", attributes={"claim_group": "patient age"}),
+                lx_data.Extraction(extraction_class="recommendation", extraction_text="verify demographics", attributes={"claim_group": "chart verification"}),
+            ],
+        ),
+        lx_data.ExampleData(
+            text=(
+                "Warfarin Sodium 5 MG Oral Tablet is active on 2020-12-23 [2]. "
+                "Review INR monitoring before medication changes."
+            ),
+            extractions=[
+                lx_data.Extraction(extraction_class="medication", extraction_text="Warfarin Sodium 5 MG Oral Tablet", attributes={"claim_group": "warfarin review"}),
+                lx_data.Extraction(extraction_class="date", extraction_text="2020-12-23", attributes={"claim_group": "warfarin review"}),
+                lx_data.Extraction(extraction_class="source", extraction_text="[2]", attributes={"claim_group": "warfarin review"}),
+                lx_data.Extraction(extraction_class="lab", extraction_text="INR", attributes={"claim_group": "warfarin review"}),
+                lx_data.Extraction(extraction_class="recommendation", extraction_text="Review INR monitoring", attributes={"claim_group": "warfarin review"}),
+            ],
+        ),
+    ]
+    return lx.extract(
+        text_or_documents=text,
+        prompt_description=prompt,
+        examples=examples,
+        model_id=os.getenv("LANGEXTRACT_CHAT_MODEL_ID", os.getenv("LANGEXTRACT_MEDICATION_MODEL_ID", "gemma2:2b")),
+        model_url=os.getenv("LANGEXTRACT_MODEL_URL", "http://localhost:11434"),
+        extraction_passes=1,
+        max_workers=1,
+        max_char_buffer=900,
+        temperature=0.0,
+        resolver_params={"suppress_parse_errors": True},
+        prompt_validation_level=lx_prompt_validation.PromptValidationLevel.OFF,
+        show_progress=False,
+    )
+
+
+def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, Optional[str], str]:
+    try:
+        lx = import_module("langextract")
+    except ImportError:
+        return pd.DataFrame(), None, "not installed"
+
+    ignored_prefixes = (
+        "question:",
+        "grounded answer:",
+        "retrieved evidence:",
+    )
+    ignored_headings = {
+        "key evidence",
+        "treatment review opportunities",
+        "missing/uncertain data",
+        "next chart checks",
+        "clinician next step",
+    }
+    lines = [
+        line.strip().strip("*").strip()
+        for line in answer_text.splitlines()
+        if line.strip()
+        and not line.strip().lower().startswith(ignored_prefixes)
+        and line.strip().strip("*").strip().lower() not in ignored_headings
+    ]
+    extraction_docs = []
+    try:
+        for line in lines:
+            extraction_docs.append(_langextract_chat_result(line))
+    except Exception as exc:
+        return pd.DataFrame(), None, f"configured but unavailable ({exc.__class__.__name__})"
+
+    rows = []
+    for line_number, result in enumerate(extraction_docs, start=1):
+        for extraction in getattr(result, "extractions", []) or []:
+            attributes = getattr(extraction, "attributes", None) or {}
+            char_interval = getattr(extraction, "char_interval", None)
+            if char_interval is None:
+                continue
+            rows.append(
+                {
+                    "line": line_number,
+                    "claim_group": attributes.get("claim_group", ""),
+                    "class": getattr(extraction, "extraction_class", ""),
+                    "text": getattr(extraction, "extraction_text", ""),
+                    "start": getattr(char_interval, "start_pos", None) if char_interval else None,
+                    "end": getattr(char_interval, "end_pos", None) if char_interval else None,
+                }
+            )
+
+    visualization_path = None
+    try:
+        output_dir = Path(".cache") / "langextract"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        lx.io.save_annotated_documents(
+            extraction_docs,
+            output_name="private_md_chat.jsonl",
+            output_dir=str(output_dir),
+        )
+        html_content = lx.visualize(str(output_dir / "private_md_chat.jsonl"))
+        visualization_path = str(output_dir / "private_md_chat.html")
+        with open(visualization_path, "w", encoding="utf-8") as handle:
+            handle.write(html_content.data if hasattr(html_content, "data") else html_content)
+    except Exception:
+        visualization_path = None
+
+    model_id = os.getenv("LANGEXTRACT_CHAT_MODEL_ID", os.getenv("LANGEXTRACT_MEDICATION_MODEL_ID", "gemma2:2b"))
+    return pd.DataFrame(rows), visualization_path, f"enabled via {model_id} local"
+
+
 def _tokens(text: str) -> List[str]:
     return [
         token
@@ -1250,13 +1377,44 @@ def _deterministic_answer(scored_chunks: List[Tuple[float, EvidenceChunk]], plan
     return "\n".join(lines)
 
 
-def answer_question(path: str, question: str) -> Tuple[str, pd.DataFrame]:
+def _plain_answer_text(answer: str) -> str:
+    cleaned_lines = []
+    for line in answer.splitlines():
+        cleaned = line.strip().replace("**", "").replace("`", "")
+        cleaned = cleaned.lstrip("-* ").strip()
+        if cleaned:
+            cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines)
+
+
+def answer_question(path: str, question: str) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, Optional[str]]:
     bundle = load_bundle(path)
     if not question.strip():
         question = "What are the most important issues in this chart?"
     direct = _direct_patient_answer(bundle, question)
     if direct:
-        return direct
+        direct_answer, evidence = direct
+        grounded = direct_answer
+        if "**Grounded answer:**\n" in grounded:
+            grounded = grounded.split("**Grounded answer:**\n", 1)[1]
+        if "\n\n**Retrieved evidence:**" in grounded:
+            grounded = grounded.split("\n\n**Retrieved evidence:**", 1)[0]
+        grounded = grounded.replace("**", "").replace("`", "").strip()
+        evidence_row = evidence.iloc[0].to_dict() if not evidence.empty else {}
+        answer_doc = (
+            f"{grounded} [1]\n"
+            f"Evidence [1]: {evidence_row.get('evidence', '')} Source: {evidence_row.get('source', '')}"
+        )
+        extracted, visualization_path, langextract_answer_state = _langextract_answer_artifacts(answer_doc)
+        return (
+            direct_answer
+            + f"\n\n**LangExtract answer highlighting:** `{langextract_answer_state}`. "
+            "Open the visualization artifact to inspect source-aligned spans.",
+            answer_doc,
+            extracted,
+            evidence,
+            visualization_path,
+        )
     scored_chunks, plan, langextract_state = retrieve_evidence(bundle, question)
     generated, generator_state = _local_gemma_answer(question, plan, scored_chunks)
     evidence_lines = [
@@ -1264,17 +1422,33 @@ def answer_question(path: str, question: str) -> Tuple[str, pd.DataFrame]:
         for rank, (_, chunk) in enumerate(scored_chunks[:8], start=1)
     ]
     answer = generated or _deterministic_answer(scored_chunks, plan)
+    clean_answer = _plain_answer_text(answer)
+    answer_doc = (
+        f"Question: {question}\n"
+        f"Grounded answer:\n{clean_answer}\n"
+        "Retrieved evidence:\n"
+        + "\n".join(
+            f"[{rank}] {chunk.text} Source: {chunk.source}"
+            for rank, (_, chunk) in enumerate(scored_chunks[:8], start=1)
+        )
+        + "\nSafety scope: This prototype does not diagnose or prescribe; clinician review is required."
+    )
+    extracted, visualization_path, langextract_answer_state = _langextract_answer_artifacts(answer_doc)
     return (
-        "PrivateMD used an advanced local RAG pipeline over typed FHIR, trend, imaging, and genomics evidence chunks. "
+        "PrivateMD selected local chart evidence, generated a grounded answer, and converted that answer into a LangExtract-highlighted document for entity/relation review. "
         "This prototype does not diagnose or prescribe; it surfaces record-backed considerations for clinician review.\n\n"
         f"**Question:** {question}\n\n"
-        f"**Pipeline:** LangExtract query planning `{langextract_state}`; fielded BM25; clinical alias expansion; resource priors; temporal intent scoring; graph expansion; MMR diversification; generation `{generator_state}`.\n\n"
+        f"**Pipeline:** LangExtract query planning `{langextract_state}`; local evidence selection; generation `{generator_state}`; answer highlighting `{langextract_answer_state}`.\n\n"
+        f"**LangExtract answer highlighting:** `{langextract_answer_state}`.\n\n"
         f"**Query Plan:** intent `{plan.intent}`; concepts `{', '.join(plan.must_have or plan.entities[:10])}`; preferred evidence `{', '.join(plan.preferred_types)}`.\n\n"
         f"**Grounded answer:**\n{answer}\n\n"
         "**Retrieved evidence:**\n"
         + "\n".join(evidence_lines)
         + "\n\n**Clinician next step:** verify the cited FHIR sources in the patient context before acting.",
+        answer_doc,
+        extracted,
         _evidence_frame(scored_chunks),
+        visualization_path,
     )
 
 

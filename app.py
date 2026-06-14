@@ -1,6 +1,6 @@
 import gradio as gr
 
-from private_md import analyze_patient, answer_question, extract_medications, patient_choices
+from private_md import analyze_patient, answer_question, patient_choices
 
 
 CSS = """
@@ -62,14 +62,8 @@ def select_patient(label):
 
 def ask(label, question):
     if not label:
-        return "Select a patient first.", None
+        return "Select a patient first.", "", None, None, None
     return answer_question(choice_lookup[label], question)
-
-
-def run_medication_extract(label):
-    if not label:
-        return "Select a patient first.", "", None, None, None, None
-    return extract_medications(choice_lookup[label])
 
 
 with gr.Blocks(title="PrivateMD") as demo:
@@ -110,52 +104,34 @@ with gr.Blocks(title="PrivateMD") as demo:
                 interactive=False,
             )
             sources = gr.Markdown()
-        with gr.Tab("LangExtract Medications"):
-            med_extract = gr.Button("Extract Medication Relationships", variant="primary")
-            med_summary = gr.Markdown()
-            med_narrative = gr.Textbox(
-                label="FHIR medication narrative sent to LangExtract",
-                lines=8,
-                interactive=False,
-            )
-            med_fhir = gr.Dataframe(
-                label="FHIR MedicationRequest reference",
-                wrap=True,
-                interactive=False,
-            )
-            med_groups = gr.Dataframe(
-                label="Grouped medications and attributes",
-                wrap=True,
-                interactive=False,
-            )
-            med_spans = gr.Dataframe(
-                label="Source-aligned extraction spans",
-                wrap=True,
-                interactive=False,
-            )
-            med_visualization = gr.File(label="LangExtract visualization HTML")
-        with gr.Tab("Copilot (RAG Experimental)"):
+        with gr.Tab("Chat"):
             question = gr.Textbox(
                 label="Ask about this patient",
                 placeholder="e.g. What should I review before changing anticoagulation?",
                 lines=2,
             )
-            ask_button = gr.Button("Search Local Evidence", variant="primary")
+            ask_button = gr.Button("Ask PrivateMD", variant="primary")
             answer = gr.Markdown()
-            retrieved = gr.Dataframe(
-                label="Retrieved evidence chunks",
+            answer_document = gr.Textbox(
+                label="Generated answer document sent to LangExtract",
+                lines=10,
+                interactive=False,
+            )
+            extracted = gr.Dataframe(
+                label="LangExtract answer entities and relations",
                 wrap=True,
                 interactive=False,
             )
+            retrieved = gr.Dataframe(
+                label="Grounding evidence",
+                wrap=True,
+                interactive=False,
+            )
+            visualization = gr.File(label="LangExtract highlighted answer HTML")
 
     load.click(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
     patient.change(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
-    med_extract.click(
-        run_medication_extract,
-        inputs=patient,
-        outputs=[med_summary, med_narrative, med_fhir, med_groups, med_spans, med_visualization],
-    )
-    ask_button.click(ask, inputs=[patient, question], outputs=[answer, retrieved])
+    ask_button.click(ask, inputs=[patient, question], outputs=[answer, answer_document, extracted, retrieved, visualization])
     demo.load(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
 
 

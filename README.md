@@ -24,20 +24,23 @@ The prototype is intentionally conservative: it does not diagnose, prescribe, or
 
 ## Grounding Architecture
 
-PrivateMD now separates two grounding streams:
+PrivateMD now uses a single chat flow for grounding:
 
-- A LangExtract medication stream based on Google's medication entity and relationship extraction pattern. It extracts source-aligned medication spans, groups related attributes with `medication_group`, writes a visualization HTML artifact, and keeps a FHIR MedicationRequest reference table beside the model output.
-- An experimental local RAG copilot stream for broader chart questions. This remains useful for exploring patient journeys, but it is secondary while the LangExtract limitations are evaluated.
+- A clinician asks one chart question.
+- PrivateMD selects relevant local FHIR, trend, imaging, and genomics evidence.
+- A local Gemma model generates a concise grounded answer from that evidence.
+- Google LangExtract converts the generated answer into a source-aligned document with highlighted entities, source citations, and grouped claim relationships.
+- The page shows the answer, the exact answer document sent to LangExtract, the extracted entities/relations table, the highlighted HTML visualization, and the underlying evidence table together.
 
-The RAG stream uses a local-first retrieval pipeline designed for clinical traceability:
+The local evidence-selection layer is designed for clinical traceability:
 
 - Typed evidence chunks from FHIR resources including conditions, medications, observations, diagnostic reports, encounters, procedures, care plans, imaging metadata, DNA summaries, and derived lab trends.
 - Query planning with clinical alias expansion and optional Google LangExtract extraction.
 - Multi-stage retrieval with fielded BM25, resource-type priors, temporal intent scoring, graph expansion through encounters/facets, and MMR diversification to avoid repeated near-duplicate evidence.
-- Optional Gemma 3 4B generation layer over retrieved evidence, with deterministic synthesis as the fallback when no local model server is running.
+- Optional Gemma 3 4B generation layer over selected evidence, with deterministic synthesis as the fallback when no local model server is running.
 - Source citations remain visible in the answer and in the retrieved evidence table.
 
-LangExtract query planning and the local generator are designed around Gemma 3 4B. The medication extraction stream defaults to the smaller `gemma2:2b` Ollama model because Google's local LangExtract medication examples use that path and it is fast enough for one-MedicationRequest-at-a-time extraction.
+LangExtract query planning and the local generator are designed around Gemma 3 4B. LangExtract answer highlighting defaults to the smaller `gemma2:2b` Ollama model because Google's local LangExtract examples use that path and it is fast enough for focused line-by-line extraction.
 
 With Ollama:
 
@@ -51,19 +54,20 @@ Then run PrivateMD with LangExtract and Gemma generation:
 ```bash
 export PRIVATE_MD_USE_LANGEXTRACT=1
 export LANGEXTRACT_MODEL_ID=gemma3:4b
-export LANGEXTRACT_MEDICATION_MODEL_ID=gemma2:2b
+export LANGEXTRACT_CHAT_MODEL_ID=gemma2:2b
 export LANGEXTRACT_MODEL_URL=http://localhost:11434
 export PRIVATE_MD_GENERATOR=ollama
 export PRIVATE_MD_OLLAMA_MODEL=gemma3:4b
 python app.py
 ```
 
-The LangExtract Medications tab returns:
+The Chat tab returns:
 
-- A compact FHIR medication narrative sent to LangExtract.
-- The original MedicationRequest table with source keys mapped back to full FHIR IDs.
-- Grouped medication attributes including dose, route, status, date, requester, and source key.
-- Source-aligned extraction spans and an interactive LangExtract visualization HTML file.
+- A grounded answer for clinician review.
+- The generated answer document sent to LangExtract.
+- Extracted entities and relations grouped by `claim_group`.
+- The local evidence table used to ground the answer.
+- An interactive LangExtract visualization HTML file.
 
 LangExtract requires Python 3.10 or newer. This repo has been tested locally with Python 3.11.
 
