@@ -438,6 +438,7 @@ def _langextract_entities(text: str) -> Tuple[Set[str], str]:
         lx = import_module("langextract")
         lx_data = import_module("langextract.data")
         lx_prompt_validation = import_module("langextract.prompt_validation")
+        lx_ollama = import_module("langextract.providers.ollama")
     except ImportError:
         return set(), "not installed"
 
@@ -468,20 +469,28 @@ def _langextract_entities(text: str) -> Tuple[Set[str], str]:
     status = f"enabled via {model_id}"
     if "gemini" not in model_id.lower():
         status += " local"
+    model = None
     resolver_params = {"suppress_parse_errors": True}
-    language_model_params = {"format_type": "json"}
+    if "gemini" not in model_id.lower():
+        model = lx_ollama.OllamaLanguageModel(
+            model_id=model_id,
+            model_url=model_url,
+            timeout=int(os.getenv("LANGEXTRACT_TIMEOUT", "120")),
+        )
+        resolver_params["format_handler"] = lx_ollama.OLLAMA_FORMAT_HANDLER
     kwargs = dict(
         text_or_documents=text[:2000],
         prompt_description=prompt,
         examples=examples,
-        model_id=model_id,
-        model_url=model_url,
+        model=model,
+        model_id=model_id if model is None else None,
+        model_url=model_url if model is None else None,
         extraction_passes=1,
         max_workers=1,
         max_char_buffer=800,
         temperature=0.0,
+        use_schema_constraints=False,
         resolver_params=resolver_params,
-        language_model_params=language_model_params,
         prompt_validation_level=lx_prompt_validation.PromptValidationLevel.OFF,
         show_progress=False,
     )
@@ -813,7 +822,7 @@ def _graph_expand(candidates: List[Tuple[float, EvidenceChunk]], all_chunks: Lis
 def _mmr_select(scored: List[Tuple[float, EvidenceChunk]], top_k: int) -> List[Tuple[float, EvidenceChunk]]:
     if not scored:
         return []
-    remaining = sorted(scored, key=lambda item: item[0], reverse=True)
+    remaining = sorted(scored, key=lambda item: (item[0], _parse_date(item[1].date)), reverse=True)
     selected: List[Tuple[float, EvidenceChunk]] = []
     seen_sources: Set[str] = set()
     cluster_counts: Dict[str, int] = {}
@@ -839,6 +848,27 @@ def _mmr_select(scored: List[Tuple[float, EvidenceChunk]], top_k: int) -> List[T
     return selected
 
 
+def _suppress_observations_covered_by_trends(selected: List[Tuple[float, EvidenceChunk]], top_k: int) -> List[Tuple[float, EvidenceChunk]]:
+    trend_facets = set()
+    for _, chunk in selected:
+        if chunk.resource_type == "Trend":
+            trend_facets.update(set(chunk.facets).intersection({"a1c", "kidney", "blood pressure", "obesity"}))
+    if not trend_facets:
+        return selected[:top_k]
+
+    filtered: List[Tuple[float, EvidenceChunk]] = []
+    deferred: List[Tuple[float, EvidenceChunk]] = []
+    for score, chunk in selected:
+        overlap = set(chunk.facets).intersection(trend_facets)
+        if chunk.resource_type == "Observation" and overlap:
+            deferred.append((score, chunk))
+        else:
+            filtered.append((score, chunk))
+    if len(filtered) < top_k:
+        filtered.extend(deferred[: top_k - len(filtered)])
+    return filtered[:top_k]
+
+
 def retrieve_evidence(bundle: Dict[str, Any], question: str, top_k: int = 12) -> Tuple[List[Tuple[float, EvidenceChunk]], QueryPlan, str]:
     chunks = _rag_chunks(bundle)
     plan = _query_plan(question)
@@ -861,7 +891,8 @@ def retrieve_evidence(bundle: Dict[str, Any], question: str, top_k: int = 12) ->
     expanded = _graph_expand(sorted(scored, key=lambda item: item[0], reverse=True)[:30], chunks)
     deduped = {chunk.chunk_id: max(score, 0.01) for score, chunk in expanded}
     rescored = [(deduped[chunk.chunk_id], chunk) for chunk in chunks if chunk.chunk_id in deduped]
-    return _mmr_select(rescored, top_k), plan, langextract_state
+    diversified = _mmr_select(rescored, top_k * 2)
+    return _suppress_observations_covered_by_trends(diversified, top_k), plan, langextract_state
 
 
 def _evidence_frame(scored_chunks: List[Tuple[float, EvidenceChunk]]) -> pd.DataFrame:
@@ -889,6 +920,8 @@ def _grounding_prompt(question: str, plan: QueryPlan, scored_chunks: List[Tuple[
     return (
         "You are PrivateMD, a clinician-facing chart review copilot. Use only the cited local evidence. "
         "Do not diagnose, prescribe, or invent missing facts. If evidence is insufficient, say exactly what is missing. "
+        "When a trend chunk is present, use it as the authoritative source for latest/older values and do not call an older single observation the most recent value. "
+        "When medication records conflict, respect chronology and status: a later active order supersedes an older stopped order unless evidence says otherwise. "
         "Write a concise clinical review with sections: Key evidence, Treatment review opportunities, Missing/uncertain data, Next chart checks. "
         "Every factual claim must cite bracket numbers like [1] or [2].\n\n"
         f"Question: {question}\n"
