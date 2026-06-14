@@ -1,6 +1,6 @@
 import gradio as gr
 
-from private_md import analyze_patient, answer_question, patient_choices
+from private_md import analyze_patient, answer_question, extract_medications, patient_choices
 
 
 CSS = """
@@ -66,6 +66,12 @@ def ask(label, question):
     return answer_question(choice_lookup[label], question)
 
 
+def run_medication_extract(label):
+    if not label:
+        return "Select a patient first.", "", None, None, None, None
+    return extract_medications(choice_lookup[label])
+
+
 with gr.Blocks(title="PrivateMD") as demo:
     gr.HTML(
         """
@@ -104,7 +110,31 @@ with gr.Blocks(title="PrivateMD") as demo:
                 interactive=False,
             )
             sources = gr.Markdown()
-        with gr.Tab("Copilot"):
+        with gr.Tab("LangExtract Medications"):
+            med_extract = gr.Button("Extract Medication Relationships", variant="primary")
+            med_summary = gr.Markdown()
+            med_narrative = gr.Textbox(
+                label="FHIR medication narrative sent to LangExtract",
+                lines=8,
+                interactive=False,
+            )
+            med_fhir = gr.Dataframe(
+                label="FHIR MedicationRequest reference",
+                wrap=True,
+                interactive=False,
+            )
+            med_groups = gr.Dataframe(
+                label="Grouped medications and attributes",
+                wrap=True,
+                interactive=False,
+            )
+            med_spans = gr.Dataframe(
+                label="Source-aligned extraction spans",
+                wrap=True,
+                interactive=False,
+            )
+            med_visualization = gr.File(label="LangExtract visualization HTML")
+        with gr.Tab("Copilot (RAG Experimental)"):
             question = gr.Textbox(
                 label="Ask about this patient",
                 placeholder="e.g. What should I review before changing anticoagulation?",
@@ -120,6 +150,11 @@ with gr.Blocks(title="PrivateMD") as demo:
 
     load.click(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
     patient.change(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
+    med_extract.click(
+        run_medication_extract,
+        inputs=patient,
+        outputs=[med_summary, med_narrative, med_fhir, med_groups, med_spans, med_visualization],
+    )
     ask_button.click(ask, inputs=[patient, question], outputs=[answer, retrieved])
     demo.load(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
 

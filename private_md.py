@@ -420,6 +420,192 @@ def _context_lines(bundle: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _medication_resources(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return sorted(
+        _entries(bundle, "MedicationRequest"),
+        key=lambda med: _parse_date(med.get("authoredOn")),
+        reverse=True,
+    )
+
+
+def _medication_narrative(bundle: Dict[str, Any]) -> str:
+    limit = int(os.getenv("LANGEXTRACT_MEDICATION_LIMIT", "5"))
+    medications = _medication_resources(bundle)
+    if not medications:
+        return "No MedicationRequest resources were found in this FHIR bundle."
+    lines = []
+    for index, med in enumerate(medications[:limit], start=1):
+        name = _coding_text(med.get("medicationCodeableConcept", {}))
+        if not name:
+            continue
+        date = _date(med.get("authoredOn")) or "unknown date"
+        status = med.get("status", "unknown status")
+        requester = med.get("requester", {}).get("display", "unknown requester")
+        lines.append(
+            f"MedicationRequest MR{index}: {name}, status {status}, authored {date}, requester {requester}."
+        )
+    return "\n".join(lines)
+
+
+def _medication_fhir_frame(bundle: Dict[str, Any]) -> pd.DataFrame:
+    medications = sorted(
+        _entries(bundle, "MedicationRequest"),
+        key=lambda med: _parse_date(med.get("authoredOn")),
+        reverse=True,
+    )
+    rows = []
+    for index, med in enumerate(medications, start=1):
+        rows.append(
+            {
+                "source_key": f"MR{index}",
+                "date": _date(med.get("authoredOn")),
+                "medication": _coding_text(med.get("medicationCodeableConcept", {})),
+                "status": med.get("status", ""),
+                "requester": med.get("requester", {}).get("display", ""),
+                "source": f"MedicationRequest/{med.get('id', '')}",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _langextract_medication_result(text: str):
+    lx = import_module("langextract")
+    lx_data = import_module("langextract.data")
+    lx_prompt_validation = import_module("langextract.prompt_validation")
+    prompt = """
+Extract medications with their details, using attributes to group related information:
+1. Extract entities in the order they appear in the text.
+2. Extract source, medication, dosage, route, status, date, requester, frequency, duration, and condition when present.
+3. Each entity must have a medication_group attribute linking it to its medication.
+4. All details about a medication should share the same medication_group value.
+5. Use exact text spans from the input.
+"""
+    examples = [
+        lx_data.ExampleData(
+            text=(
+                "MedicationRequest MR1: Lisinopril 10 MG Oral Tablet, status active, "
+                "authored 2020-01-10, requester Dr. Rivera."
+            ),
+            extractions=[
+                lx_data.Extraction(extraction_class="source", extraction_text="MR1", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="medication", extraction_text="Lisinopril 10 MG Oral Tablet", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="dosage", extraction_text="10 MG", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="route", extraction_text="Oral", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="status", extraction_text="active", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="date", extraction_text="2020-01-10", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+                lx_data.Extraction(extraction_class="requester", extraction_text="Dr. Rivera", attributes={"medication_group": "Lisinopril 10 MG Oral Tablet"}),
+            ],
+        ),
+        lx_data.ExampleData(
+            text=(
+                "Patient takes Aspirin 100mg daily for heart health and "
+                "Simvastatin 20mg at bedtime."
+            ),
+            extractions=[
+                lx_data.Extraction(extraction_class="medication", extraction_text="Aspirin", attributes={"medication_group": "Aspirin"}),
+                lx_data.Extraction(extraction_class="dosage", extraction_text="100mg", attributes={"medication_group": "Aspirin"}),
+                lx_data.Extraction(extraction_class="frequency", extraction_text="daily", attributes={"medication_group": "Aspirin"}),
+                lx_data.Extraction(extraction_class="condition", extraction_text="heart health", attributes={"medication_group": "Aspirin"}),
+                lx_data.Extraction(extraction_class="medication", extraction_text="Simvastatin", attributes={"medication_group": "Simvastatin"}),
+                lx_data.Extraction(extraction_class="dosage", extraction_text="20mg", attributes={"medication_group": "Simvastatin"}),
+                lx_data.Extraction(extraction_class="frequency", extraction_text="at bedtime", attributes={"medication_group": "Simvastatin"}),
+            ],
+        ),
+    ]
+    return lx.extract(
+        text_or_documents=text,
+        prompt_description=prompt,
+        examples=examples,
+        model_id=os.getenv("LANGEXTRACT_MEDICATION_MODEL_ID", "gemma2:2b"),
+        model_url=os.getenv("LANGEXTRACT_MODEL_URL", "http://localhost:11434"),
+        extraction_passes=1,
+        max_workers=1,
+        max_char_buffer=1200,
+        temperature=0.0,
+        resolver_params={"suppress_parse_errors": True},
+        prompt_validation_level=lx_prompt_validation.PromptValidationLevel.OFF,
+        show_progress=False,
+    )
+
+
+def extract_medications(path: str) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[str]]:
+    bundle = load_bundle(path)
+    narrative = _medication_narrative(bundle)
+    fhir_frame = _medication_fhir_frame(bundle)
+    try:
+        lx = import_module("langextract")
+        result_documents = []
+        extracted_lines = [
+            (line_number, line)
+            for line_number, line in enumerate(narrative.splitlines(), start=1)
+            if line.strip()
+        ]
+        for _, line in extracted_lines:
+            result_documents.append(_langextract_medication_result(line))
+    except Exception as exc:
+        summary = (
+            "### LangExtract Medication Stream\n"
+            f"LangExtract could not complete medication extraction: `{exc.__class__.__name__}`.\n\n"
+            "The FHIR medication narrative is still shown so you can inspect the input."
+        )
+        return summary, narrative, fhir_frame, pd.DataFrame(), pd.DataFrame(), None
+
+    rows = []
+    groups: Dict[str, Dict[str, str]] = {}
+    for line_number, result in enumerate(result_documents, start=1):
+        for extraction in getattr(result, "extractions", []) or []:
+            attributes = getattr(extraction, "attributes", None) or {}
+            group = attributes.get("medication_group") or "ungrouped"
+            char_interval = getattr(extraction, "char_interval", None)
+            start = getattr(char_interval, "start_pos", None) if char_interval else None
+            end = getattr(char_interval, "end_pos", None) if char_interval else None
+            extraction_class = getattr(extraction, "extraction_class", "")
+            extraction_text = getattr(extraction, "extraction_text", "")
+            rows.append(
+                {
+                    "line": line_number,
+                    "group": group,
+                    "class": extraction_class,
+                    "text": extraction_text,
+                    "start": start,
+                    "end": end,
+                }
+            )
+            group_key = f"{line_number}:{group}"
+            grouped = groups.setdefault(group_key, {"line": line_number, "medication_group": group})
+            if extraction_class:
+                existing = grouped.get(extraction_class)
+                grouped[extraction_class] = (
+                    extraction_text if not existing else f"{existing}; {extraction_text}"
+                )
+
+    grouped_frame = pd.DataFrame(groups.values())
+    spans_frame = pd.DataFrame(rows)
+    visualization_path = None
+    try:
+        output_dir = Path(".cache") / "langextract"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        lx.io.save_annotated_documents(
+            result_documents,
+            output_name="private_md_medications.jsonl",
+            output_dir=str(output_dir),
+        )
+        html_content = lx.visualize(str(output_dir / "private_md_medications.jsonl"))
+        visualization_path = str(output_dir / "private_md_medications.html")
+        with open(visualization_path, "w", encoding="utf-8") as handle:
+            handle.write(html_content.data if hasattr(html_content, "data") else html_content)
+    except Exception:
+        visualization_path = None
+
+    summary = (
+        "### LangExtract Medication Stream\n"
+        f"Extracted `{len(spans_frame)}` medication-related spans across `{len(grouped_frame)}` medication groups.\n\n"
+        f"Medication extraction model: `{os.getenv('LANGEXTRACT_MEDICATION_MODEL_ID', 'gemma2:2b')}`.\n\n"
+        "This stream uses source-aligned extraction and `medication_group` relationship attributes before any RAG generation."
+    )
+    return summary, narrative, fhir_frame, grouped_frame, spans_frame, visualization_path
+
+
 def _tokens(text: str) -> List[str]:
     return [
         token

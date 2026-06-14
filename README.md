@@ -24,7 +24,12 @@ The prototype is intentionally conservative: it does not diagnose, prescribe, or
 
 ## Grounding Architecture
 
-PrivateMD uses a local-first RAG pipeline designed for clinical traceability:
+PrivateMD now separates two grounding streams:
+
+- A LangExtract medication stream based on Google's medication entity and relationship extraction pattern. It extracts source-aligned medication spans, groups related attributes with `medication_group`, writes a visualization HTML artifact, and keeps a FHIR MedicationRequest reference table beside the model output.
+- An experimental local RAG copilot stream for broader chart questions. This remains useful for exploring patient journeys, but it is secondary while the LangExtract limitations are evaluated.
+
+The RAG stream uses a local-first retrieval pipeline designed for clinical traceability:
 
 - Typed evidence chunks from FHIR resources including conditions, medications, observations, diagnostic reports, encounters, procedures, care plans, imaging metadata, DNA summaries, and derived lab trends.
 - Query planning with clinical alias expansion and optional Google LangExtract extraction.
@@ -32,10 +37,13 @@ PrivateMD uses a local-first RAG pipeline designed for clinical traceability:
 - Optional Gemma 3 4B generation layer over retrieved evidence, with deterministic synthesis as the fallback when no local model server is running.
 - Source citations remain visible in the answer and in the retrieved evidence table.
 
-LangExtract and the local generator are designed around Gemma 3 4B. With Ollama:
+LangExtract query planning and the local generator are designed around Gemma 3 4B. The medication extraction stream defaults to the smaller `gemma2:2b` Ollama model because Google's local LangExtract medication examples use that path and it is fast enough for one-MedicationRequest-at-a-time extraction.
+
+With Ollama:
 
 ```bash
 ollama pull gemma3:4b
+ollama pull gemma2:2b
 ```
 
 Then run PrivateMD with LangExtract and Gemma generation:
@@ -43,11 +51,19 @@ Then run PrivateMD with LangExtract and Gemma generation:
 ```bash
 export PRIVATE_MD_USE_LANGEXTRACT=1
 export LANGEXTRACT_MODEL_ID=gemma3:4b
+export LANGEXTRACT_MEDICATION_MODEL_ID=gemma2:2b
 export LANGEXTRACT_MODEL_URL=http://localhost:11434
 export PRIVATE_MD_GENERATOR=ollama
 export PRIVATE_MD_OLLAMA_MODEL=gemma3:4b
 python app.py
 ```
+
+The LangExtract Medications tab returns:
+
+- A compact FHIR medication narrative sent to LangExtract.
+- The original MedicationRequest table with source keys mapped back to full FHIR IDs.
+- Grouped medication attributes including dose, route, status, date, requester, and source key.
+- Source-aligned extraction spans and an interactive LangExtract visualization HTML file.
 
 LangExtract requires Python 3.10 or newer. This repo has been tested locally with Python 3.11.
 
