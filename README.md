@@ -40,6 +40,10 @@ pip install -r requirements.txt
 python app.py
 ```
 
+## Development Attribution
+
+PrivateMD was built in collaboration with OpenAI Codex, including project scaffolding, FHIR parsing logic, Gradio interface development, local verification, and repository setup.
+
 ## Submission Checklist
 
 - Add demo video link here.
