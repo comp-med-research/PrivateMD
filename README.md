@@ -27,57 +27,43 @@ The prototype is intentionally conservative: it does not diagnose, prescribe, or
 PrivateMD now uses a single chat flow for grounding:
 
 - A clinician asks one chart question.
-- PrivateMD selects relevant local FHIR, trend, imaging, and genomics evidence.
-- A local Gemma model generates a concise grounded answer from that evidence.
-- Google LangExtract converts the generated answer into a source-aligned document with highlighted entities, source citations, and grouped claim relationships.
-- The page shows the embedded highlighted visualization first, followed by the answer, the exact answer document sent to LangExtract, the extracted entities/relations table, and the underlying evidence table.
+- PrivateMD builds a compact source document from the original local patient record: demographics, conditions, medication requests, observations, procedures, imaging, and genomics summaries.
+- Google LangExtract extracts question-relevant entities and relationships directly from that source document.
+- PrivateMD synthesizes the visible answer from the extracted spans and their source lines; the chat path does not use the RAG pipeline or a separate generation model.
+- The page shows the embedded highlighted source visualization first, followed by the answer, the exact source document sent to LangExtract, the extracted entities/relations table, and the source-line evidence table.
 
-The local evidence-selection layer is designed for clinical traceability:
+The LangExtract source document is designed for clinical traceability:
 
-- Typed evidence chunks from FHIR resources including conditions, medications, observations, diagnostic reports, encounters, procedures, care plans, imaging metadata, DNA summaries, and derived lab trends.
-- Query planning with clinical alias expansion and optional Google LangExtract extraction.
-- Multi-stage retrieval with fielded BM25, resource-type priors, temporal intent scoring, graph expansion through encounters/facets, and MMR diversification to avoid repeated near-duplicate evidence.
-- Optional Gemma 3 4B generation layer over selected evidence, with deterministic synthesis as the fallback when no local model server is running.
-- Source citations remain visible in the answer and in the retrieved evidence table.
+- Every source line has a bracket citation such as `[1]` and a FHIR/DNA source reference.
+- Extracted spans keep `claim_group` relationship attributes.
+- The highlighted visualization is embedded directly in the Chat tab.
+- The evidence table preserves the original source line, date, resource type, and FHIR source.
 
-LangExtract query planning and the local generator are designed around Gemma 3 4B. LangExtract answer highlighting defaults to the smaller `gemma2:2b` Ollama model because Google's local LangExtract examples use that path and it is fast enough for focused line-by-line extraction.
+LangExtract defaults to the smaller `gemma2:2b` Ollama model because Google's local LangExtract examples use that path and it is fast enough for focused line-by-line extraction.
 
 With Ollama:
 
 ```bash
-ollama pull gemma3:4b
 ollama pull gemma2:2b
 ```
 
-Then run PrivateMD with LangExtract and Gemma generation:
+Then run PrivateMD with local LangExtract:
 
 ```bash
-export PRIVATE_MD_USE_LANGEXTRACT=1
-export LANGEXTRACT_MODEL_ID=gemma3:4b
 export LANGEXTRACT_CHAT_MODEL_ID=gemma2:2b
 export LANGEXTRACT_MODEL_URL=http://localhost:11434
-export PRIVATE_MD_GENERATOR=ollama
-export PRIVATE_MD_OLLAMA_MODEL=gemma3:4b
 python app.py
 ```
 
 The Chat tab returns:
 
 - A grounded answer for clinician review.
-- The generated answer document sent to LangExtract.
+- The original chart source document sent to LangExtract.
 - Extracted entities and relations grouped by `claim_group`.
-- The local evidence table used to ground the answer.
+- The source-line evidence table used to ground the answer.
 - An embedded interactive LangExtract visualization.
 
 LangExtract requires Python 3.10 or newer. This repo has been tested locally with Python 3.11.
-
-Optional Hugging Face Transformers generation can use the official 4B instruction model when `transformers`, `torch`, and accepted Gemma model access are available:
-
-```bash
-export PRIVATE_MD_GENERATOR=hf
-export PRIVATE_MD_GEMMA_MODEL=google/gemma-3-4b-it
-python app.py
-```
 
 ## Hackathon Fit
 

@@ -118,12 +118,12 @@ with gr.Blocks(title="PrivateMD") as demo:
             )
             answer = gr.Markdown()
             answer_document = gr.Textbox(
-                label="Generated answer document sent to LangExtract",
+                label="Original chart source document sent to LangExtract",
                 lines=10,
                 interactive=False,
             )
             extracted = gr.Dataframe(
-                label="LangExtract answer entities and relations",
+                label="LangExtract source entities and relations",
                 wrap=True,
                 interactive=False,
             )
