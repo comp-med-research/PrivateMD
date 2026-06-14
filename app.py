@@ -62,7 +62,7 @@ def select_patient(label):
 
 def ask(label, question):
     if not label:
-        return "Select a patient first."
+        return "Select a patient first.", None
     return answer_question(choice_lookup[label], question)
 
 
@@ -114,10 +114,16 @@ with gr.Blocks(css=CSS, title="PrivateMD") as demo:
             )
             ask_button = gr.Button("Search Local Evidence", variant="primary")
             answer = gr.Markdown()
+            retrieved = gr.Dataframe(
+                label="Retrieved evidence chunks",
+                wrap=True,
+                interactive=False,
+                height=320,
+            )
 
     load.click(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
     patient.change(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
-    ask_button.click(ask, inputs=[patient, question], outputs=answer)
+    ask_button.click(ask, inputs=[patient, question], outputs=[answer, retrieved])
     demo.load(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
 
 

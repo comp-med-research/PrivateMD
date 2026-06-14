@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
+from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -20,6 +23,40 @@ DNA_DIR = DATA_DIR / "dna"
 class PatientChoice:
     label: str
     path: str
+
+
+@dataclass(frozen=True)
+class EvidenceChunk:
+    chunk_id: str
+    resource_type: str
+    date: str
+    title: str
+    text: str
+    source: str
+    entities: Tuple[str, ...]
+    resource: Dict[str, Any]
+
+
+RESOURCE_PRIORS = {
+    "Condition": 1.35,
+    "MedicationRequest": 1.3,
+    "Observation": 1.2,
+    "DiagnosticReport": 1.15,
+    "CarePlan": 1.15,
+    "Procedure": 1.05,
+    "ImagingStudy": 1.05,
+    "Encounter": 0.9,
+}
+
+CLINICAL_ALIASES = {
+    "a1c": {"a1c", "hba1c", "hemoglobin", "glycemic", "diabetes"},
+    "anticoagulation": {"warfarin", "inr", "prothrombin", "anticoagulation", "bleeding"},
+    "heart failure": {"heart", "failure", "congestive", "sodium", "volume", "edema"},
+    "blood pressure": {"blood", "pressure", "systolic", "diastolic", "hypertension"},
+    "obesity": {"bmi", "body", "mass", "weight", "obesity"},
+    "genomics": {"gene", "variant", "pathogenic", "genomic", "dna"},
+    "imaging": {"image", "imaging", "radiography", "modality", "dicom"},
+}
 
 
 def _entries(bundle: Dict[str, Any], resource_type: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -348,26 +385,284 @@ def _context_lines(bundle: Dict[str, Any]) -> List[str]:
     return lines
 
 
-def answer_question(path: str, question: str) -> str:
+def _tokens(text: str) -> List[str]:
+    return [token for token in re.findall(r"[a-zA-Z0-9]+", text.lower()) if len(token) > 2]
+
+
+def _clinical_entities(text: str) -> Set[str]:
+    tokens = set(_tokens(text))
+    entities = set(tokens)
+    lower = text.lower()
+    for label, aliases in CLINICAL_ALIASES.items():
+        if label in lower or tokens.intersection(aliases):
+            entities.add(label)
+            entities.update(aliases)
+    return entities
+
+
+def _langextract_entities(text: str) -> Set[str]:
+    """Use Google LangExtract when configured; otherwise stay fully local and deterministic.
+
+    LangExtract is intentionally optional because cloud extraction requires API keys and
+    local extraction requires an Ollama model such as gemma2:2b.
+    """
+    if os.getenv("PRIVATE_MD_USE_LANGEXTRACT", "").lower() not in {"1", "true", "yes"}:
+        return set()
+    try:
+        lx = import_module("langextract")
+    except ImportError:
+        return set()
+
+    prompt = (
+        "Extract clinical entities from this chart text. Keep extractions verbatim and grounded "
+        "to the source. Classes: condition, medication, lab, procedure, imaging, gene, risk_factor."
+    )
+    try:
+        result = lx.extract(
+            text_or_documents=text[:4000],
+            prompt_description=prompt,
+            examples=[],
+            model_id=os.getenv("LANGEXTRACT_MODEL_ID", "gemma2:2b"),
+            model_url=os.getenv("LANGEXTRACT_MODEL_URL", "http://localhost:11434"),
+            extraction_passes=1,
+            max_workers=1,
+            max_char_buffer=1000,
+        )
+    except Exception:
+        return set()
+
+    extracted: Set[str] = set()
+    for extraction in getattr(result, "extractions", []) or []:
+        if getattr(extraction, "char_interval", True) is None:
+            continue
+        value = getattr(extraction, "extraction_text", "")
+        if value:
+            extracted.update(_tokens(value))
+            extracted.add(value.lower())
+    return extracted
+
+
+def _resource_title(resource: Dict[str, Any]) -> str:
+    resource_type = resource.get("resourceType", "")
+    if resource_type == "MedicationRequest":
+        return _coding_text(resource.get("medicationCodeableConcept", {}))
+    if resource_type == "Encounter":
+        return _coding_text((resource.get("type") or [{}])[0])
+    if resource_type == "CarePlan":
+        return _coding_text((resource.get("category") or [{}])[-1])
+    if resource_type == "ImagingStudy":
+        series = resource.get("series") or [{}]
+        return " ".join(
+            part
+            for part in [
+                _coding_text(series[0].get("modality", {})),
+                _coding_text(series[0].get("bodySite", {})),
+            ]
+            if part
+        )
+    if resource_type == "DiagnosticReport":
+        return _coding_text(resource.get("code", {}))
+    return _coding_text(resource.get("code", {})) or resource_type
+
+
+def _resource_date(resource: Dict[str, Any]) -> str:
+    value = (
+        resource.get("recordedDate")
+        or resource.get("effectiveDateTime")
+        or resource.get("authoredOn")
+        or resource.get("started")
+        or resource.get("issued")
+        or resource.get("onsetDateTime")
+        or resource.get("performedDateTime")
+        or resource.get("period", {}).get("start")
+        or resource.get("performedPeriod", {}).get("start")
+    )
+    return _date(value)
+
+
+def _chunk_text(resource: Dict[str, Any]) -> str:
+    resource_type = resource.get("resourceType", "")
+    title = _resource_title(resource)
+    fields = [f"{resource_type}: {title}"]
+    date = _resource_date(resource)
+    if date:
+        fields.append(f"date: {date}")
+    if resource_type == "Observation":
+        fields.append(f"value: {_quantity(resource)}")
+    if resource_type == "MedicationRequest":
+        fields.append(f"status: {resource.get('status', '')}")
+        requester = resource.get("requester", {}).get("display")
+        if requester:
+            fields.append(f"requester: {requester}")
+    if resource_type == "Condition":
+        fields.append(f"clinical status: {resource.get('clinicalStatus', {}).get('coding', [{}])[0].get('code', '')}")
+    if resource_type == "CarePlan":
+        text = re.sub(r"<[^>]+>", " ", resource.get("text", {}).get("div", ""))
+        if text:
+            fields.append(f"plan text: {' '.join(text.split())}")
+    if resource_type == "DiagnosticReport":
+        conclusion = resource.get("conclusion")
+        if conclusion:
+            fields.append(f"conclusion: {conclusion}")
+    if resource_type == "ImagingStudy":
+        series = resource.get("series") or [{}]
+        fields.append(f"series: {_coding_text(series[0].get('modality', {}))} {_coding_text(series[0].get('bodySite', {}))}")
+    return "; ".join(part for part in fields if part)
+
+
+def _rag_chunks(bundle: Dict[str, Any]) -> List[EvidenceChunk]:
+    useful_types = {
+        "Condition",
+        "MedicationRequest",
+        "Observation",
+        "DiagnosticReport",
+        "Procedure",
+        "Encounter",
+        "ImagingStudy",
+        "CarePlan",
+    }
+    chunks: List[EvidenceChunk] = []
+    for resource in _entries(bundle):
+        resource_type = resource.get("resourceType", "")
+        if resource_type not in useful_types:
+            continue
+        title = _resource_title(resource)
+        text = _chunk_text(resource)
+        entities = _clinical_entities(text)
+        chunks.append(
+            EvidenceChunk(
+                chunk_id=f"{resource_type}/{resource.get('id', len(chunks))}",
+                resource_type=resource_type,
+                date=_resource_date(resource),
+                title=title,
+                text=text,
+                source=_source(resource),
+                entities=tuple(sorted(entities)),
+                resource=resource,
+            )
+        )
+    return chunks
+
+
+def _bm25_score(query_terms: List[str], chunk_terms: List[str], avg_len: float, doc_count: int, document_frequency: Dict[str, int]) -> float:
+    if not query_terms or not chunk_terms:
+        return 0.0
+    k1 = 1.4
+    b = 0.72
+    length = len(chunk_terms)
+    term_counts = {term: chunk_terms.count(term) for term in set(chunk_terms)}
+    score = 0.0
+    for term in set(query_terms):
+        frequency = term_counts.get(term, 0)
+        if not frequency:
+            continue
+        df = document_frequency.get(term, 0)
+        idf = math.log(1 + (doc_count - df + 0.5) / (df + 0.5))
+        score += idf * (frequency * (k1 + 1)) / (frequency + k1 * (1 - b + b * length / max(avg_len, 1)))
+    return score
+
+
+def retrieve_evidence(bundle: Dict[str, Any], question: str, top_k: int = 10) -> List[Tuple[float, EvidenceChunk]]:
+    chunks = _rag_chunks(bundle)
+    query_entities = _clinical_entities(question) | _langextract_entities(question)
+    query_terms = sorted(query_entities | set(_tokens(question)))
+    tokenized = {chunk.chunk_id: _tokens(chunk.text) for chunk in chunks}
+    doc_count = len(chunks)
+    avg_len = sum(len(terms) for terms in tokenized.values()) / max(doc_count, 1)
+    document_frequency: Dict[str, int] = {}
+    for terms in tokenized.values():
+        for term in set(terms):
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+
+    scored: List[Tuple[float, EvidenceChunk]] = []
+    for chunk in chunks:
+        terms = tokenized[chunk.chunk_id]
+        lexical = _bm25_score(query_terms, terms, avg_len, doc_count, document_frequency)
+        entity_overlap = len(set(chunk.entities).intersection(query_entities))
+        resource_prior = RESOURCE_PRIORS.get(chunk.resource_type, 1.0)
+        recency = 0.0
+        parsed = _parse_date(chunk.date)
+        if parsed != datetime.min:
+            recency = min(max((parsed.year - 1950) / 90, 0), 0.35)
+        score = (lexical + entity_overlap * 1.8 + recency) * resource_prior
+        if score > 0:
+            scored.append((score, chunk))
+    if not scored:
+        scored = [(0.1, chunk) for chunk in sorted(chunks, key=lambda item: item.date, reverse=True)[:top_k]]
+    return sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]
+
+
+def _evidence_frame(scored_chunks: List[Tuple[float, EvidenceChunk]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "rank": rank,
+                "score": round(score, 3),
+                "type": chunk.resource_type,
+                "date": chunk.date,
+                "evidence": chunk.text,
+                "source": chunk.source,
+            }
+            for rank, (score, chunk) in enumerate(scored_chunks, start=1)
+        ]
+    )
+
+
+def _local_gemma_answer(question: str, scored_chunks: List[Tuple[float, EvidenceChunk]]) -> Optional[str]:
+    """Optional local generation hook for small Gemma models.
+
+    Set PRIVATE_MD_GENERATOR=gemma and PRIVATE_MD_GEMMA_MODEL to a local HF model id
+    only when transformers/torch and model weights are available.
+    """
+    if os.getenv("PRIVATE_MD_GENERATOR", "").lower() != "gemma":
+        return None
+    try:
+        transformers = import_module("transformers")
+    except ImportError:
+        return None
+    model_id = os.getenv("PRIVATE_MD_GEMMA_MODEL", "google/gemma-2-2b-it")
+    context = "\n".join(f"[{i}] {chunk.text}" for i, (_, chunk) in enumerate(scored_chunks[:6], start=1))
+    prompt = (
+        "You are PrivateMD, a clinician-facing chart review assistant. Use only the cited local evidence. "
+        "Do not diagnose or prescribe. Return concise review considerations with citation numbers.\n\n"
+        f"Question: {question}\n\nEvidence:\n{context}\n\nAnswer:"
+    )
+    try:
+        pipe = transformers.pipeline("text-generation", model=model_id, device_map="auto")
+        output = pipe(prompt, max_new_tokens=220, do_sample=False, return_full_text=False)
+    except Exception:
+        return None
+    if output and isinstance(output, list):
+        return output[0].get("generated_text", "").strip() or None
+    return None
+
+
+def answer_question(path: str, question: str) -> Tuple[str, pd.DataFrame]:
     bundle = load_bundle(path)
-    question_terms = [term for term in re.findall(r"[a-zA-Z0-9]+", question.lower()) if len(term) > 2]
-    lines = _context_lines(bundle)
-    scored = []
-    for line in lines:
-        lower = line.lower()
-        score = sum(term in lower for term in question_terms)
-        if score:
-            scored.append((score, line))
-    top = [line for _, line in sorted(scored, reverse=True)[:8]] or lines[:8]
     if not question.strip():
         question = "What are the most important issues in this chart?"
+    scored_chunks = retrieve_evidence(bundle, question)
+    generated = _local_gemma_answer(question, scored_chunks)
+    evidence_lines = [
+        f"- [{rank}] {chunk.text}  \n  Source: `{chunk.source}`"
+        for rank, (_, chunk) in enumerate(scored_chunks[:8], start=1)
+    ]
+    langextract_state = "enabled" if os.getenv("PRIVATE_MD_USE_LANGEXTRACT", "").lower() in {"1", "true", "yes"} else "available but off"
+    generator_state = "Gemma local generation" if generated else "deterministic synthesis"
+    answer = generated or (
+        "The retrieved evidence points to these chart-backed review areas:\n"
+        + "\n".join(evidence_lines[:5])
+    )
     return (
-        "PrivateMD found the most relevant local chart evidence below. "
+        "PrivateMD used a local hybrid RAG pipeline over typed FHIR evidence chunks. "
         "This prototype does not diagnose or prescribe; it surfaces record-backed considerations for clinician review.\n\n"
         f"**Question:** {question}\n\n"
-        "**Grounded answer:**\n"
-        + "\n".join(f"- {line}" for line in top)
-        + "\n\n**Clinician next step:** verify the cited FHIR sources in the patient context before acting."
+        f"**Pipeline:** BM25-style retrieval + clinical entity expansion + resource weighting + recency boost; LangExtract {langextract_state}; {generator_state}.\n\n"
+        f"**Grounded answer:**\n{answer}\n\n"
+        "**Retrieved evidence:**\n"
+        + "\n".join(evidence_lines)
+        + "\n\n**Clinician next step:** verify the cited FHIR sources in the patient context before acting.",
+        _evidence_frame(scored_chunks),
     )
 
 
