@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import re
 import math
 import os
@@ -663,11 +664,25 @@ Rules:
     )
 
 
-def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, Optional[str], str]:
+def _embedded_visualization_html(content: Optional[str]) -> str:
+    if not content:
+        return (
+            "<div style='border:1px solid #dbe3ea;border-radius:8px;padding:16px;"
+            "background:#f7faf9;color:#5b6475;'>LangExtract visualization will appear here after a question is answered.</div>"
+        )
+    escaped = html.escape(content, quote=True)
+    return (
+        "<iframe title='LangExtract highlighted answer' "
+        "style='width:100%;height:520px;border:1px solid #dbe3ea;border-radius:8px;background:white;' "
+        f"srcdoc=\"{escaped}\"></iframe>"
+    )
+
+
+def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, str, str]:
     try:
         lx = import_module("langextract")
     except ImportError:
-        return pd.DataFrame(), None, "not installed"
+        return pd.DataFrame(), _embedded_visualization_html(None), "not installed"
 
     ignored_prefixes = (
         "question:",
@@ -693,7 +708,7 @@ def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, Optio
         for line in lines:
             extraction_docs.append(_langextract_chat_result(line))
     except Exception as exc:
-        return pd.DataFrame(), None, f"configured but unavailable ({exc.__class__.__name__})"
+        return pd.DataFrame(), _embedded_visualization_html(None), f"configured but unavailable ({exc.__class__.__name__})"
 
     rows = []
     for line_number, result in enumerate(extraction_docs, start=1):
@@ -714,6 +729,7 @@ def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, Optio
             )
 
     visualization_path = None
+    visualization_content = None
     try:
         output_dir = Path(".cache") / "langextract"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -723,14 +739,15 @@ def _langextract_answer_artifacts(answer_text: str) -> Tuple[pd.DataFrame, Optio
             output_dir=str(output_dir),
         )
         html_content = lx.visualize(str(output_dir / "private_md_chat.jsonl"))
+        visualization_content = html_content.data if hasattr(html_content, "data") else str(html_content)
         visualization_path = str(output_dir / "private_md_chat.html")
         with open(visualization_path, "w", encoding="utf-8") as handle:
-            handle.write(html_content.data if hasattr(html_content, "data") else html_content)
+            handle.write(visualization_content)
     except Exception:
         visualization_path = None
 
     model_id = os.getenv("LANGEXTRACT_CHAT_MODEL_ID", os.getenv("LANGEXTRACT_MEDICATION_MODEL_ID", "gemma2:2b"))
-    return pd.DataFrame(rows), visualization_path, f"enabled via {model_id} local"
+    return pd.DataFrame(rows), _embedded_visualization_html(visualization_content), f"enabled via {model_id} local"
 
 
 def _tokens(text: str) -> List[str]:
@@ -1387,7 +1404,7 @@ def _plain_answer_text(answer: str) -> str:
     return "\n".join(cleaned_lines)
 
 
-def answer_question(path: str, question: str) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, Optional[str]]:
+def answer_question(path: str, question: str) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, str]:
     bundle = load_bundle(path)
     if not question.strip():
         question = "What are the most important issues in this chart?"
@@ -1409,7 +1426,7 @@ def answer_question(path: str, question: str) -> Tuple[str, str, pd.DataFrame, p
         return (
             direct_answer
             + f"\n\n**LangExtract answer highlighting:** `{langextract_answer_state}`. "
-            "Open the visualization artifact to inspect source-aligned spans.",
+            "The embedded visualization shows source-aligned spans.",
             answer_doc,
             extracted,
             evidence,

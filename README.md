@@ -30,7 +30,7 @@ PrivateMD now uses a single chat flow for grounding:
 - PrivateMD selects relevant local FHIR, trend, imaging, and genomics evidence.
 - A local Gemma model generates a concise grounded answer from that evidence.
 - Google LangExtract converts the generated answer into a source-aligned document with highlighted entities, source citations, and grouped claim relationships.
-- The page shows the answer, the exact answer document sent to LangExtract, the extracted entities/relations table, the highlighted HTML visualization, and the underlying evidence table together.
+- The page shows the embedded highlighted visualization first, followed by the answer, the exact answer document sent to LangExtract, the extracted entities/relations table, and the underlying evidence table.
 
 The local evidence-selection layer is designed for clinical traceability:
 
@@ -67,7 +67,7 @@ The Chat tab returns:
 - The generated answer document sent to LangExtract.
 - Extracted entities and relations grouped by `claim_group`.
 - The local evidence table used to ground the answer.
-- An interactive LangExtract visualization HTML file.
+- An embedded interactive LangExtract visualization.
 
 LangExtract requires Python 3.10 or newer. This repo has been tested locally with Python 3.11.
 

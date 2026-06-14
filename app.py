@@ -62,8 +62,9 @@ def select_patient(label):
 
 def ask(label, question):
     if not label:
-        return "Select a patient first.", "", None, None, None
-    return answer_question(choice_lookup[label], question)
+        return "<p>Select a patient first.</p>", "Select a patient first.", "", None, None
+    answer, answer_document, extracted, retrieved, visualization = answer_question(choice_lookup[label], question)
+    return visualization, answer, answer_document, extracted, retrieved
 
 
 with gr.Blocks(title="PrivateMD") as demo:
@@ -111,6 +112,10 @@ with gr.Blocks(title="PrivateMD") as demo:
                 lines=2,
             )
             ask_button = gr.Button("Ask PrivateMD", variant="primary")
+            visualization = gr.HTML(
+                value="<div style='border:1px solid #dbe3ea;border-radius:8px;padding:16px;background:#f7faf9;color:#5b6475;'>LangExtract visualization will appear here after a question is answered.</div>",
+                label="LangExtract highlighted answer",
+            )
             answer = gr.Markdown()
             answer_document = gr.Textbox(
                 label="Generated answer document sent to LangExtract",
@@ -127,11 +132,10 @@ with gr.Blocks(title="PrivateMD") as demo:
                 wrap=True,
                 interactive=False,
             )
-            visualization = gr.File(label="LangExtract highlighted answer HTML")
 
     load.click(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
     patient.change(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
-    ask_button.click(ask, inputs=[patient, question], outputs=[answer, answer_document, extracted, retrieved, visualization])
+    ask_button.click(ask, inputs=[patient, question], outputs=[visualization, answer, answer_document, extracted, retrieved])
     demo.load(select_patient, inputs=patient, outputs=[snapshot, timeline, opportunities, sources])
 
 
