@@ -1,0 +1,14 @@
+.DS_Store
+.venv/
+.pycache/
+__pycache__/
+.cache/
+*.py[cod]
+
+# Large local dataset artifacts. Add a tiny curated sample or use HF datasets/LFS later.
+data/
+*.zip
+
+# Local environment/config
+.env
+.env.*
